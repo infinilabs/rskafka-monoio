@@ -226,10 +226,10 @@ async fn maybe_retry<B, R, F, T>(
 ) -> Result<T>
 where
     B: BrokerCache,
-    R: (Fn() -> F) + Send + Sync,
+    R: (Fn() -> F),
     F: std::future::Future<
-            Output = Result<T, ErrorOrThrottle<(Error, Option<BrokerCacheGeneration>)>>,
-        > + Send,
+        Output = Result<T, ErrorOrThrottle<(Error, Option<BrokerCacheGeneration>)>>,
+    >,
 {
     let mut backoff = Backoff::new(backoff_config);
 

@@ -81,7 +81,7 @@ pub async fn consume(
     partition_index: i32,
     n: usize,
 ) -> Vec<RecordAndOffset> {
-    tokio::time::timeout(Duration::from_secs(10), async move {
+    monoio::time::timeout(Duration::from_secs(10), async move {
         loop {
             // create client
             let mut cfg = ClientConfig::new();
@@ -133,7 +133,7 @@ pub async fn consume(
                         "Encountered rdkafka error while consuming, try again: {:?}",
                         e
                     );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    monoio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             }

@@ -4,7 +4,7 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::{io::BufStream, sync::Mutex};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::backoff::ErrorOrThrottle;
@@ -29,7 +29,7 @@ mod transport;
 
 /// A connection to a broker
 pub type BrokerConnection = Arc<MessengerTransport>;
-pub type MessengerTransport = Messenger<BufStream<transport::Transport>>;
+pub type MessengerTransport = Messenger<transport::Transport>;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -56,7 +56,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Error)]
-pub struct MultiError(Vec<Box<dyn std::error::Error + Send + Sync>>);
+pub struct MultiError(Vec<Box<dyn std::error::Error>>);
 
 impl Display for MultiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,7 +77,7 @@ impl Display for MultiError {
 
 /// How to connect to a `Transport`
 trait ConnectionHandler {
-    type R: RequestHandler + Send + Sync;
+    type R: RequestHandler;
 
     fn connect(
         &self,
@@ -86,7 +86,7 @@ trait ConnectionHandler {
         socks5_proxy: Option<String>,
         sasl_config: Option<SaslConfig>,
         max_message_size: usize,
-    ) -> impl Future<Output = Result<Arc<Self::R>>> + Send;
+    ) -> impl Future<Output = Result<Arc<Self::R>>>;
 }
 
 /// Defines the possible request modes of metadata retrieval.
@@ -162,7 +162,7 @@ impl ConnectionHandler for BrokerRepresentation {
                 error,
             })?;
 
-        let mut messenger = Messenger::new(BufStream::new(transport), max_message_size, client_id);
+        let mut messenger = Messenger::new(transport, max_message_size, client_id);
         messenger.sync_versions().await?;
         if let Some(sasl_config) = sasl_config {
             messenger.do_sasl(sasl_config).await?;
@@ -374,7 +374,7 @@ trait RequestHandler {
     fn metadata_request(
         &self,
         request_params: &MetadataRequest,
-    ) -> impl Future<Output = Result<MetadataResponse, RequestError>> + Send;
+    ) -> impl Future<Output = Result<MetadataResponse, RequestError>>;
 }
 
 impl RequestHandler for MessengerTransport {
@@ -410,19 +410,17 @@ impl BrokerCacheGeneration {
     }
 }
 
-pub trait BrokerCache: Send + Sync {
-    type R: Send + Sync;
-    type E: std::error::Error + Send + Sync;
+pub trait BrokerCache {
+    type R;
+    type E: std::error::Error;
 
-    fn get(
-        &self,
-    ) -> impl Future<Output = Result<(Arc<Self::R>, BrokerCacheGeneration), Self::E>> + Send;
+    fn get(&self) -> impl Future<Output = Result<(Arc<Self::R>, BrokerCacheGeneration), Self::E>>;
 
     fn invalidate(
         &self,
         reason: &'static str,
         gen: BrokerCacheGeneration,
-    ) -> impl Future<Output = ()> + Send;
+    ) -> impl Future<Output = ()>;
 }
 
 /// BrokerConnector caches an arbitrary broker that can successfully connect.
@@ -482,7 +480,7 @@ async fn connect_to_a_broker_with_retry<B>(
     max_message_size: usize,
 ) -> Result<Arc<B::R>>
 where
-    B: ConnectionHandler + Send + Sync,
+    B: ConnectionHandler,
 {
     // Randomise search order to encourage different clients to choose different brokers
     brokers.shuffle(&mut thread_rng());
@@ -490,7 +488,7 @@ where
     let mut backoff = Backoff::new(backoff_config);
     backoff
         .retry_with_backoff("broker_connect", || async {
-            let mut errors = Vec::<Box<dyn std::error::Error + Send + Sync>>::new();
+            let mut errors = Vec::<Box<dyn std::error::Error>>::new();
             for broker in &brokers {
                 let conn = broker
                     .connect(
@@ -513,8 +511,8 @@ where
 
                 return ControlFlow::Break(connection);
             }
-            let err = Box::<dyn std::error::Error + Send + Sync>::from(MultiError(errors));
-            let err: Arc<dyn std::error::Error + Send + Sync> = err.into();
+            let err = Box::<dyn std::error::Error>::from(MultiError(errors));
+            let err: Arc<dyn std::error::Error> = err.into();
             ControlFlow::Continue(ErrorOrThrottle::Error(err))
         })
         .await
@@ -628,7 +626,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn happy_cached_broker() {
         let metadata_request = arbitrary_metadata_request();
         let success_response = arbitrary_metadata_response();
@@ -650,7 +648,7 @@ mod tests {
         assert_eq!(success_response, result)
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn fatal_error_cached_broker() {
         let metadata_request = arbitrary_metadata_request();
 
@@ -674,7 +672,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn sad_cached_broker() {
         // Start with always returning a broker that fails.
         let succeed = Arc::new(AtomicBool::new(false));
@@ -712,7 +710,7 @@ mod tests {
         assert_eq!(success_response, result)
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn happy_broker_override() {
         let broker_override = Arc::new(FakeBroker::success());
         let metadata_request = arbitrary_metadata_request();
@@ -735,7 +733,7 @@ mod tests {
         assert_eq!(success_response, result)
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn sad_broker_override() {
         let broker_override = Arc::new(FakeBroker::recoverable());
         let metadata_request = arbitrary_metadata_request();
@@ -815,7 +813,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn connect_picks_successful_broker() {
         let brokers = vec![
             // One broker where `connection` always succceeds

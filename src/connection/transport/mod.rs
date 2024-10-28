@@ -1,17 +1,19 @@
-use std::ops::DerefMut;
-use std::pin::Pin;
+mod sasl;
+
+pub use sasl::{Credentials, SaslConfig};
+
 #[cfg(feature = "transport-tls")]
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 
 #[cfg(feature = "transport-tls")]
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
-mod sasl;
-pub use sasl::{Credentials, SaslConfig};
+use monoio::io::Split;
+use monoio::{
+    io::{AsyncReadRent, AsyncWriteRent},
+    net::tcp::TcpStream,
+};
 
 #[cfg(feature = "transport-tls")]
 pub type TlsConfig = Option<Arc<rustls::ClientConfig>>;
@@ -62,50 +64,69 @@ pub enum Transport {
     Plain { inner: TcpStream },
 }
 
-impl AsyncRead for Transport {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.deref_mut() {
-            Self::Plain { inner } => Pin::new(inner).poll_read(cx, buf),
-
+impl AsyncReadRent for Transport {
+    async fn read<T: monoio::buf::IoBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        match self {
+            Self::Plain { inner } => inner.read(buf).await,
             #[cfg(feature = "transport-tls")]
-            Self::Tls { inner } => inner.as_mut().poll_read(cx, buf),
+            Self::Tls => {
+                unimplemented!()
+            }
+        }
+    }
+
+    async fn readv<T: monoio::buf::IoVecBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        match self {
+            Self::Plain { inner } => inner.readv(buf).await,
+            #[cfg(feature = "transport-tls")]
+            Self::Tls => {
+                unimplemented!()
+            }
         }
     }
 }
 
-impl AsyncWrite for Transport {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.deref_mut() {
-            Self::Plain { inner } => Pin::new(inner).poll_write(cx, buf),
-
+impl AsyncWriteRent for Transport {
+    async fn write<T: monoio::buf::IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        match self {
+            Self::Plain { inner } => inner.write(buf).await,
             #[cfg(feature = "transport-tls")]
-            Self::Tls { inner } => inner.as_mut().poll_write(cx, buf),
+            Self::Tls => {
+                unimplemented!()
+            }
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.deref_mut() {
-            Self::Plain { inner } => Pin::new(inner).poll_flush(cx),
-
+    async fn writev<T: monoio::buf::IoVecBuf>(
+        &mut self,
+        buf_vec: T,
+    ) -> monoio::BufResult<usize, T> {
+        match self {
+            Self::Plain { inner } => inner.writev(buf_vec).await,
             #[cfg(feature = "transport-tls")]
-            Self::Tls { inner } => inner.as_mut().poll_flush(cx),
+            Self::Tls => {
+                unimplemented!()
+            }
         }
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.deref_mut() {
-            Self::Plain { inner } => Pin::new(inner).poll_shutdown(cx),
-
+    async fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain { inner } => inner.flush().await,
             #[cfg(feature = "transport-tls")]
-            Self::Tls { inner } => inner.as_mut().poll_shutdown(cx),
+            Self::Tls => {
+                unimplemented!()
+            }
+        }
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain { inner } => inner.shutdown().await,
+            #[cfg(feature = "transport-tls")]
+            Self::Tls => {
+                unimplemented!()
+            }
         }
     }
 }
@@ -147,7 +168,8 @@ impl Transport {
 
     #[cfg(not(feature = "transport-socks5"))]
     async fn connect_tcp(broker: &str, _socks5_proxy: Option<String>) -> Result<TcpStream> {
-        Ok(TcpStream::connect(broker).await?)
+        let connect_result = TcpStream::connect(broker).await;
+        Ok(connect_result?)
     }
 
     #[cfg(feature = "transport-tls")]
@@ -181,3 +203,10 @@ impl Transport {
         Ok(Self::Plain { inner: tcp_stream })
     }
 }
+
+/// SAFETY:
+///
+/// `Transport` is just a wrapper of `TcpStream` when feature `transport-tls`
+/// is disabled, and `TcpStream` can be safely split, so we are safe.
+#[allow(unsafe_code)]
+unsafe impl Split for Transport {}

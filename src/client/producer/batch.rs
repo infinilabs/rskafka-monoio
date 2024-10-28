@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::task::JoinHandle;
+use monoio::task::JoinHandle;
 use tracing::*;
 
 use super::{
@@ -9,6 +9,7 @@ use super::{
     Error, ProducerClient,
 };
 use crate::client::partition::Compression;
+use tokio::sync::oneshot::Sender as TokioOneshotSender;
 
 pub(super) type BatchWriteResult<A> = Result<Arc<AggregatedStatus<A>>, Error>;
 
@@ -69,9 +70,18 @@ where
 
 /// A call to [`BatchBuilder::background_flush()`] can either succeed or fail,
 /// and a new [`BatchBuilder`] is always returned for the next set of writes.
-pub(crate) enum FlushResult<T> {
-    Ok(T, Option<JoinHandle<()>>),
-    Error(T, Error),
+pub(crate) enum FlushResult<BatchBuilder> {
+    /// `(JoinHandle<()>, TokioOneshotReceiver<()>)` are the join handle
+    /// of the spawned background flush task and the sending end of the signal
+    /// that is used to stop the task.
+    Ok(
+        BatchBuilder,
+        Option<(
+            JoinHandle<Result<(), Box<dyn Any + 'static>>>,
+            TokioOneshotSender<()>,
+        )>,
+    ),
+    Error(BatchBuilder, Error),
 }
 
 /// A [`BatchBuilder`] uses an [`Aggregator`] to construct maximally large batch
@@ -153,24 +163,49 @@ where
             return FlushResult::Ok(Self::new(self.aggregator), None);
         }
 
-        let handle = tokio::spawn({
-            let broadcast = self.results;
-            async move {
-                let res = match client.produce(batch, compression).await {
-                    Ok(status) => Ok(Arc::new(AggregatedStatus {
-                        aggregated_status: status,
-                        status_deagg,
-                    })),
-                    Err(e) => {
-                        error!(?client, error=?e, "Failed to produce records");
-                        Err(Error::Client(Arc::new(e)))
-                    }
-                };
-
-                broadcast.broadcast(res);
+        let (stop_signal_tx, stop_signal_rx) = tokio::sync::oneshot::channel::<()>();
+        // The use `spawn_catch_unwind()` is required by the test `test_producer_aggregator_panic()`,
+        // see its comments for more information.
+        let handle = spawn_catch_unwind(async move {
+            tokio::select! {
+                produce_res = client.produce(batch, compression) => {
+                    let res = match produce_res {
+                        Ok(status) => Ok(Arc::new(AggregatedStatus {
+                            aggregated_status: status,
+                            status_deagg,
+                        })),
+                        Err(e) => {
+                            error!(?client, error=?e, "Failed to produce records");
+                            Err(Error::Client(Arc::new(e)))
+                        }
+                    };
+                    let broadcast = self.results;
+                    broadcast.broadcast(res);
+                },
+                _ = stop_signal_rx => {
+                    return;
+                }
             }
         });
 
-        FlushResult::Ok(Self::new(self.aggregator), Some(handle))
+        FlushResult::Ok(Self::new(self.aggregator), Some((handle, stop_signal_tx)))
     }
+}
+
+// TODO: Monoio will add this method, remove this impl and replace it with `monoio::spawn_catch_unwind`
+// once added.
+use futures::{FutureExt, TryFutureExt};
+use std::{any::Any, future::Future};
+/// Like [`spawn()`](monoio::task::spawn()), but will catch the panic that happens
+/// in the task.
+fn spawn_catch_unwind<F>(future: F) -> JoinHandle<Result<F::Output, Box<dyn Any + 'static>>>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    let future = std::panic::AssertUnwindSafe(future)
+        .catch_unwind()
+        .map_err(|e| e as Box<dyn Any + 'static>);
+
+    monoio::spawn(future)
 }

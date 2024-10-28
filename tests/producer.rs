@@ -10,7 +10,7 @@ mod test_helpers;
 use std::sync::Arc;
 use test_helpers::{maybe_start_logging, random_topic_name, record};
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_batch_producer() {
     maybe_start_logging();
 
@@ -49,7 +49,7 @@ async fn test_batch_producer() {
     futures::select! {
         _ = a => panic!("a finished!"),
         _ = b => panic!("b finished!"),
-        _ = tokio::time::sleep(Duration::from_millis(100)).fuse() => {}
+        _ = monoio::time::sleep(Duration::from_millis(100)).fuse() => {}
     };
 
     let c = producer.produce(record).fuse();
@@ -61,7 +61,7 @@ async fn test_batch_producer() {
             r = a => r.unwrap(),
             r = b => r.unwrap(),
             _ = c => panic!("c finished!"),
-            _ = tokio::time::sleep(Duration::from_millis(4_000)).fuse() => break
+            _ = monoio::time::sleep(Duration::from_millis(4_000)).fuse() => break
         };
     }
 
@@ -69,7 +69,7 @@ async fn test_batch_producer() {
     assert!(b.is_terminated());
 
     // Third record should eventually be published
-    tokio::time::timeout(Duration::from_secs(6), c)
+    monoio::time::timeout(Duration::from_secs(6), c)
         .await
         .expect("no timeout")
         .unwrap();

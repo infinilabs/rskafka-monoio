@@ -14,7 +14,7 @@ use std::{collections::BTreeMap, env, str::FromStr, sync::Arc, time::Duration};
 mod test_helpers;
 use test_helpers::{maybe_start_logging, random_topic_name, record, BrokerImpl, TEST_TIMEOUT};
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_plain() {
     maybe_start_logging();
 
@@ -25,7 +25,7 @@ async fn test_plain() {
         .unwrap();
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_sasl() {
     maybe_start_logging();
     if env::var("TEST_INTEGRATION").is_err() {
@@ -49,7 +49,7 @@ async fn test_sasl() {
         .unwrap();
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_topic_crud() {
     maybe_start_logging();
 
@@ -84,7 +84,7 @@ async fn test_topic_crud() {
     }
 
     // might take a while to converge
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    monoio::time::timeout(TEST_TIMEOUT, async {
         loop {
             let topics = client.list_topics().await.unwrap();
             if new_topics
@@ -94,7 +94,7 @@ async fn test_topic_crud() {
                 return;
             }
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            monoio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -120,7 +120,7 @@ async fn test_topic_crud() {
         .unwrap();
 
     // might take a while to converge
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    monoio::time::timeout(TEST_TIMEOUT, async {
         loop {
             let topics = client.list_topics().await.unwrap();
             if topics.iter().all(|t| t.name != new_topics[0])
@@ -129,14 +129,14 @@ async fn test_topic_crud() {
                 return;
             }
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            monoio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_partition_client() {
     maybe_start_logging();
 
@@ -162,7 +162,7 @@ async fn test_partition_client() {
     assert_eq!(partition_client.partition(), 0);
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_non_existing_partition() {
     maybe_start_logging();
 
@@ -177,7 +177,7 @@ async fn test_non_existing_partition() {
     // do NOT create the topic
 
     // short timeout, should just check that we will never finish
-    tokio::time::timeout(Duration::from_millis(100), async {
+    monoio::time::timeout(Duration::from_millis(100), async {
         client
             .partition_client(topic_name.clone(), 0, UnknownTopicHandling::Retry)
             .await
@@ -201,7 +201,7 @@ async fn test_non_existing_partition() {
 
 // Disabled as currently no TLS integration tests
 #[ignore]
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 #[cfg(feature = "transport-tls")]
 async fn test_tls() {
     maybe_start_logging();
@@ -245,7 +245,7 @@ async fn test_tls() {
 }
 
 #[cfg(feature = "transport-socks5")]
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_socks5() {
     maybe_start_logging();
 
@@ -284,7 +284,7 @@ async fn test_socks5() {
     assert_eq!(record, record2);
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_produce_empty() {
     maybe_start_logging();
 
@@ -312,7 +312,7 @@ async fn test_produce_empty() {
         .unwrap();
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_consume_empty() {
     maybe_start_logging();
 
@@ -342,7 +342,7 @@ async fn test_consume_empty() {
     assert_eq!(watermark, 0);
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_consume_offset_out_of_range() {
     maybe_start_logging();
 
@@ -385,7 +385,7 @@ async fn test_consume_offset_out_of_range() {
     );
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_get_offset() {
     maybe_start_logging();
 
@@ -453,7 +453,7 @@ async fn test_get_offset() {
     );
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_produce_consume_size_cutoff() {
     maybe_start_logging();
 
@@ -534,7 +534,7 @@ async fn test_produce_consume_size_cutoff() {
     assert!(is_kafka ^ is_redpanda);
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_consume_midbatch() {
     maybe_start_logging();
 
@@ -585,7 +585,7 @@ async fn test_consume_midbatch() {
     );
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_delete_records() {
     maybe_start_logging();
 
@@ -704,7 +704,7 @@ async fn test_delete_records() {
     );
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_client_backoff_terminates() {
     maybe_start_logging();
 

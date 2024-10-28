@@ -207,9 +207,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
+use futures::future::LocalBoxFuture;
+use monoio::task::JoinHandle;
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot::Sender as TokioOneshotSender;
 use tracing::*;
 
 use self::{
@@ -309,14 +310,14 @@ impl BatchProducerBuilder {
 ///
 /// Most users will want to use the [`BatchProducer`] implementation of this
 /// trait.
-pub trait ProducerClient: std::fmt::Debug + Send + Sync {
+pub trait ProducerClient: std::fmt::Debug {
     /// Write the set of `records` to the Kafka broker, using the specified
     /// `compression` algorithm.
     fn produce(
         &self,
         records: Vec<Record>,
         compression: Compression,
-    ) -> BoxFuture<'_, Result<Vec<i64>, ClientError>>;
+    ) -> LocalBoxFuture<'_, Result<Vec<i64>, ClientError>>;
 }
 
 impl ProducerClient for PartitionClient {
@@ -324,12 +325,12 @@ impl ProducerClient for PartitionClient {
         &self,
         records: Vec<Record>,
         compression: Compression,
-    ) -> BoxFuture<'_, Result<Vec<i64>, ClientError>> {
+    ) -> LocalBoxFuture<'_, Result<Vec<i64>, ClientError>> {
         Box::pin(self.produce(records, compression))
     }
 }
 
-#[derive(Debug)]
+/// Inner of a [`BatchProducer`].
 struct ProducerInner<A>
 where
     A: aggregator::Aggregator,
@@ -364,12 +365,32 @@ where
     compression: Compression,
     client: Arc<dyn ProducerClient>,
 
-    /// A list of (potentially) outstanding flush tasks.
+    /// For every spawned background flush task, we store its `JoinHandle` and
+    /// the sending end of a channel that can be used to stop it in this field.
     ///
-    /// These may or may not yet be complete, and completed flush tasks are
-    /// removed from this list when adding new flush tasks or manually flushing
-    /// with a call to [`BatchProducer::flush()`].
-    pending_flushes: Vec<JoinHandle<()>>,
+    /// The spawned tasks may or may not yet be complete, and completed flush
+    /// tasks are removed from this list when adding new flush tasks or manually
+    /// flushing with a call to [`BatchProducer::flush()`].
+    pending_flushes: Vec<(
+        JoinHandle<Result<(), Box<dyn std::any::Any + 'static>>>,
+        TokioOneshotSender<()>,
+    )>,
+}
+
+impl<A> std::fmt::Debug for ProducerInner<A>
+where
+    A: std::fmt::Debug + aggregator::Aggregator,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProducerInner")
+            .field("batch_builder", &self.batch_builder)
+            .field("flush_clock", &self.flush_clock)
+            .field("has_linger_waiter", &self.has_linger_waiter)
+            .field("compression", &self.compression)
+            .field("client", &self.client)
+            // .field("pending_flushes", &self.pending_flushes) // monoio::task::JoinHandle is not Debug
+            .finish()
+    }
 }
 
 impl<A> Drop for ProducerInner<A>
@@ -379,7 +400,13 @@ where
     fn drop(&mut self) {
         // Abort any in-progress flushes to avoid leaking tasks when
         // ProducerInner is dropped.
-        self.pending_flushes.drain(..).for_each(|f| f.abort());
+        self.pending_flushes
+            .drain(..)
+            .for_each(|(_handle, stop_signal_tx)| {
+                // Ignore the send result bc the task may be complete so that
+                // the rx end was dropped.
+                let _ = stop_signal_tx.send(());
+            });
     }
 }
 
@@ -495,9 +522,11 @@ where
         // immediately replaced with a new batch instance below.
         let batch = self.batch_builder.take().expect("no batch to flush");
 
-        let (new_builder, flush_task, maybe_err) =
+        let (new_builder, flush_task_handle_and_stop_signal_tx, maybe_err) =
             match batch.background_flush(Arc::clone(&self.client), self.compression) {
-                FlushResult::Ok(b, flush_task) => (b, flush_task, None),
+                FlushResult::Ok(b, flush_task_handle_and_stop_signal_tx) => {
+                    (b, flush_task_handle_and_stop_signal_tx, None)
+                }
                 FlushResult::Error(b, e) => {
                     error!(client=?self.client, error=%e, "failed to write record batch");
                     (b, None, Some(e))
@@ -511,13 +540,14 @@ where
         //
         // Ideally this would be a linked list so removing elements are cheap,
         // but LinkedList in stable cannot do that...
-        self.pending_flushes.retain_mut(|t| !t.is_finished());
+        self.pending_flushes
+            .retain_mut(|(join_handle, _stop_signal_tx)| !join_handle.is_finished());
 
         // Retain a handle to the flush task.
         //
         // This enables a manual flush to wait for all outstanding flush tasks
         // to complete.
-        if let Some(t) = flush_task {
+        if let Some(t) = flush_task_handle_and_stop_signal_tx {
             self.pending_flushes.push(t);
         }
 
@@ -622,11 +652,11 @@ where
                 // duration, and then attempt to flush the batch of writes.
                 //
                 // Spawn a task for the linger to ensure cancellation safety.
-                let linger: JoinHandle<Result<(), Error>> = tokio::spawn({
+                let linger: JoinHandle<Result<(), Error>> = monoio::spawn({
                     let linger = self.linger;
                     let inner = Arc::clone(&self.inner);
                     async move {
-                        tokio::time::sleep(linger).await;
+                        monoio::time::sleep(linger).await;
 
                         // The linger has expired, attempt to conditionally flush the
                         // batch using the provided token to ensure only the correct
@@ -639,7 +669,7 @@ where
                 // The batch may be flushed before the linger period expires if
                 // the aggregator becomes full, so watch for both outcomes.
                 tokio::select! {
-                    res = linger => res.expect("linger panic")?,
+                    res = linger => res.expect("linger panic"),
                     r = handle.wait() => return handle.result(r?),
                 }
 
@@ -668,9 +698,9 @@ where
         };
 
         // Wait for all pending flushes to complete outside of the mutex.
-        for t in outstanding.into_iter() {
-            if !t.is_finished() {
-                t.await.expect("flush task panic");
+        for (join_handle, _stop_signal_tx) in outstanding.into_iter() {
+            if !join_handle.is_finished() {
+                join_handle.await;
             }
         }
 
@@ -703,9 +733,9 @@ mod tests {
             &self,
             records: Vec<Record>,
             _compression: Compression,
-        ) -> BoxFuture<'_, Result<Vec<i64>, ClientError>> {
+        ) -> LocalBoxFuture<'_, Result<Vec<i64>, ClientError>> {
             Box::pin(async move {
-                tokio::time::sleep(self.delay).await;
+                monoio::time::sleep(self.delay).await;
 
                 if let Some(e) = self.error {
                     return Err(ClientError::ServerError {
@@ -741,7 +771,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn test_producer() {
         let record = record();
         let linger = Duration::from_millis(100);
@@ -775,28 +805,28 @@ mod tests {
 
             // First two publishes should be ok
             assert_ok(
-                tokio::time::timeout(Duration::from_millis(10), futures.next()).await,
+                monoio::time::timeout(Duration::from_millis(10), futures.next()).await,
                 0,
             );
             assert_ok(
-                tokio::time::timeout(Duration::from_millis(10), futures.next()).await,
+                monoio::time::timeout(Duration::from_millis(10), futures.next()).await,
                 1,
             );
 
             // Third should linger
-            tokio::time::timeout(Duration::from_millis(10), futures.next())
+            monoio::time::timeout(Duration::from_millis(10), futures.next())
                 .await
                 .expect_err("timeout");
 
             assert_eq!(client.batch_sizes.lock().as_slice(), &[2]);
 
             // Should publish third record after linger expires
-            assert_ok(tokio::time::timeout(linger * 2, futures.next()).await, 2);
+            assert_ok(monoio::time::timeout(linger * 2, futures.next()).await, 2);
             assert_eq!(client.batch_sizes.lock().as_slice(), &[2, 1]);
         }
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn test_manual_flush() {
         let record = record();
         let linger = Duration::from_secs(3600);
@@ -822,23 +852,23 @@ mod tests {
         futures::select! {
             _ = a => panic!("a finished!"),
             _ = b => panic!("b finished!"),
-            _ = tokio::time::sleep(Duration::from_millis(100)).fuse() => {}
+            _ = monoio::time::sleep(Duration::from_millis(100)).fuse() => {}
         };
 
         producer.flush().await.unwrap();
 
-        let offset_a = tokio::time::timeout(Duration::from_millis(10), a)
+        let offset_a = monoio::time::timeout(Duration::from_millis(10), a)
             .await
             .unwrap()
             .unwrap();
-        let offset_b = tokio::time::timeout(Duration::from_millis(10), b)
+        let offset_b = monoio::time::timeout(Duration::from_millis(10), b)
             .await
             .unwrap()
             .unwrap();
         assert!(((offset_a == 0) && (offset_b == 1)) || ((offset_a == 1) && (offset_b == 0)));
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn test_producer_empty_aggregator_with_linger() {
         // this setting used to result in a panic
         let record = record();
@@ -903,7 +933,7 @@ mod tests {
         while futures.next().await.is_some() {}
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn test_producer_client_error() {
         let record = record();
         let linger = Duration::from_millis(5);
@@ -927,7 +957,7 @@ mod tests {
         futures.next().await.unwrap().unwrap_err();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn test_producer_aggregator_error_push() {
         let record = record();
         let linger = Duration::from_millis(5);
@@ -957,7 +987,7 @@ mod tests {
         futures.next().await.unwrap().unwrap();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn test_producer_aggregator_error_flush() {
         let record = record();
         let linger = Duration::from_millis(5);
@@ -986,7 +1016,7 @@ mod tests {
         futures.next().await.unwrap().unwrap_err();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn test_producer_aggregator_error_deagg() {
         let record = record();
         let linger = Duration::from_millis(5);
@@ -1019,7 +1049,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn test_producer_aggregator_cancel() {
         let record = record();
         let linger = Duration::from_micros(100);
@@ -1048,12 +1078,12 @@ mod tests {
             futures::select_biased! {
                 _ = &mut a => panic!("a should not have flushed"),
                 _ = &mut b => panic!("b should not have flushed"),
-                _ = tokio::time::sleep(Duration::from_millis(1)).fuse() => {},
+                _ = monoio::time::sleep(Duration::from_millis(1)).fuse() => {},
             }
         }
 
         // But b should still complete successfully
-        tokio::time::timeout(Duration::from_secs(1), b)
+        monoio::time::timeout(Duration::from_secs(1), b)
             .await
             .unwrap()
             .unwrap();
@@ -1061,7 +1091,11 @@ mod tests {
         assert_eq!(client.batch_sizes.lock().as_slice(), &[2]);
     }
 
-    #[tokio::test]
+    /// In this test, a `panic!()` will be invoked in `<MockClient as ProducerClient>::produce()`,
+    /// which will be executed by the background flush task. To make the test
+    /// complete, panics happen in the background flush async task have to be
+    /// caught.
+    #[monoio::test(enable_timer = true)]
     async fn test_producer_aggregator_panic() {
         let record = record();
         let linger = Duration::from_millis(100);
