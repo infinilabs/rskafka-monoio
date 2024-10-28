@@ -26,7 +26,7 @@ impl Default for BackoffConfig {
     }
 }
 
-type SourceError = Box<dyn std::error::Error + Send + Sync>;
+type SourceError = Box<dyn std::error::Error>;
 
 #[derive(Debug, thiserror::Error)]
 #[allow(missing_copy_implementations)]
@@ -41,10 +41,7 @@ pub type BackoffResult<T> = Result<T, BackoffError>;
 
 /// Error (which should increase backoff) or throttle for a specific duration (as asked for by the broker).
 #[derive(Debug)]
-pub enum ErrorOrThrottle<E>
-where
-    E: Send,
-{
+pub enum ErrorOrThrottle<E> {
     Error(E),
     Throttle(Duration),
 }
@@ -106,12 +103,12 @@ impl Backoff {
         do_stuff: F,
     ) -> BackoffResult<B>
     where
-        F: (Fn() -> F1) + Send + Sync,
-        F1: std::future::Future<Output = ControlFlow<B, ErrorOrThrottle<E>>> + Send,
-        E: std::error::Error + Send + Sync + 'static,
+        F: (Fn() -> F1),
+        F1: std::future::Future<Output = ControlFlow<B, ErrorOrThrottle<E>>>,
+        E: std::error::Error + 'static,
     {
         loop {
-            // split match statement from `tokio::time::sleep`, because otherwise rustc requires `B: Send`
+            // split match statement from `monoio::time::sleep`, because otherwise rustc requires `B: Send`
             let fail = match do_stuff().await {
                 ControlFlow::Break(r) => break Ok(r),
                 ControlFlow::Continue(e) => e,
@@ -141,7 +138,7 @@ impl Backoff {
                 }
             };
 
-            tokio::time::sleep(sleep_time).await;
+            monoio::time::sleep(sleep_time).await;
         }
     }
 }

@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::future::{BoxFuture, Fuse, FusedFuture, FutureExt};
+use futures::future::{Fuse, FusedFuture, FutureExt, LocalBoxFuture};
 use futures::Stream;
 use tracing::{debug, trace, warn};
 
@@ -163,7 +163,7 @@ struct FetchResultOk {
 type FetchResult = Result<FetchResultOk>;
 
 /// A trait wrapper to allow mocking
-trait FetchClient: std::fmt::Debug + Send + Sync {
+trait FetchClient: std::fmt::Debug {
     /// Fetch records.
     ///
     /// Arguments are identical to [`PartitionClient::fetch_records`].
@@ -172,12 +172,12 @@ trait FetchClient: std::fmt::Debug + Send + Sync {
         offset: i64,
         bytes: Range<i32>,
         max_wait_ms: i32,
-    ) -> BoxFuture<'_, Result<(Vec<RecordAndOffset>, i64)>>;
+    ) -> LocalBoxFuture<'_, Result<(Vec<RecordAndOffset>, i64)>>;
 
     /// Get offset.
     ///
     /// Arguments are identical to [`PartitionClient::get_offset`].
-    fn get_offset(&self, at: OffsetAt) -> BoxFuture<'_, Result<i64>>;
+    fn get_offset(&self, at: OffsetAt) -> LocalBoxFuture<'_, Result<i64>>;
 }
 
 impl FetchClient for PartitionClient {
@@ -186,11 +186,11 @@ impl FetchClient for PartitionClient {
         offset: i64,
         bytes: Range<i32>,
         max_wait_ms: i32,
-    ) -> BoxFuture<'_, Result<(Vec<RecordAndOffset>, i64)>> {
+    ) -> LocalBoxFuture<'_, Result<(Vec<RecordAndOffset>, i64)>> {
         Box::pin(self.fetch_records(offset, bytes, max_wait_ms))
     }
 
-    fn get_offset(&self, at: OffsetAt) -> BoxFuture<'_, Result<i64>> {
+    fn get_offset(&self, at: OffsetAt) -> LocalBoxFuture<'_, Result<i64>> {
         Box::pin(self.get_offset(at))
     }
 }
@@ -221,7 +221,7 @@ pub struct StreamConsumer {
 
     buffer: VecDeque<RecordAndOffset>,
 
-    fetch_fut: Fuse<BoxFuture<'static, FetchResult>>,
+    fetch_fut: Fuse<LocalBoxFuture<'static, FetchResult>>,
 }
 
 impl Stream for StreamConsumer {
@@ -248,7 +248,7 @@ impl Stream for StreamConsumer {
 
                 self.fetch_fut = FutureExt::fuse(Box::pin(async move {
                     if let Some(backoff) = next_backoff {
-                        tokio::time::sleep(backoff).await;
+                        monoio::time::sleep(backoff).await;
                     }
 
                     let offset = match next_offset {
@@ -413,7 +413,7 @@ mod tests {
             start_offset: i64,
             bytes: Range<i32>,
             max_wait_ms: i32,
-        ) -> BoxFuture<'_, Result<(Vec<RecordAndOffset>, i64)>> {
+        ) -> LocalBoxFuture<'_, Result<(Vec<RecordAndOffset>, i64)>> {
             let inner = Arc::clone(&self.inner);
             Box::pin(async move {
                 if let Some(err) = inner.lock().await.next_err.take() {
@@ -451,7 +451,7 @@ mod tests {
                 println!("Waiting up to {} ms for more data", max_wait_ms);
 
                 // Need to wait for more data
-                let timeout = tokio::time::sleep(Duration::from_millis(max_wait_ms as u64)).fuse();
+                let timeout = monoio::time::sleep(Duration::from_millis(max_wait_ms as u64)).fuse();
                 pin_mut!(timeout);
 
                 while buffered < bytes.start as usize && !timeout.is_terminated() {
@@ -495,7 +495,7 @@ mod tests {
             })
         }
 
-        fn get_offset(&self, at: OffsetAt) -> BoxFuture<'_, Result<i64>> {
+        fn get_offset(&self, at: OffsetAt) -> LocalBoxFuture<'_, Result<i64>> {
             let inner = Arc::clone(&self.inner);
 
             Box::pin(async move {
@@ -507,7 +507,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn test_consumer() {
         let record = Record {
             key: Some(vec![0; 4]),
@@ -538,7 +538,7 @@ mod tests {
         let unwrap = |e: Result<Option<Result<_, _>>, _>| e.unwrap().unwrap().unwrap();
 
         let (record_and_offset, high_watermark) =
-            unwrap(tokio::time::timeout(Duration::from_micros(10), stream.next()).await);
+            unwrap(monoio::time::timeout(Duration::from_micros(10), stream.next()).await);
 
         assert_eq!(record_and_offset.offset, 2);
         assert_eq!(high_watermark, 2);
@@ -548,12 +548,12 @@ mod tests {
         sender.send(record.clone()).await.unwrap();
 
         let (record_and_offset, high_watermark) =
-            unwrap(tokio::time::timeout(Duration::from_micros(1), stream.next()).await);
+            unwrap(monoio::time::timeout(Duration::from_micros(1), stream.next()).await);
         assert_eq!(record_and_offset.offset, 3);
         assert_eq!(high_watermark, 5);
 
         let (record_and_offset, high_watermark) =
-            tokio::time::timeout(Duration::from_millis(1), stream.next())
+            monoio::time::timeout(Duration::from_millis(1), stream.next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(high_watermark, 5);
 
         let (record_and_offset, high_watermark) =
-            tokio::time::timeout(Duration::from_millis(1), stream.next())
+            monoio::time::timeout(Duration::from_millis(1), stream.next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -574,7 +574,7 @@ mod tests {
         assert_eq!(&received, &[1, 3]);
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn test_consumer_timeout() {
         let record = Record {
             key: Some(vec![0; 4]),
@@ -614,7 +614,7 @@ mod tests {
         sender.send(record.clone()).await.unwrap();
 
         // Should wait for max_wait_ms
-        tokio::time::timeout(Duration::from_millis(10), stream.next())
+        monoio::time::timeout(Duration::from_millis(10), stream.next())
             .await
             .unwrap()
             .unwrap()
@@ -624,20 +624,20 @@ mod tests {
         sender.send(record.clone()).await.unwrap();
 
         // Should not wait for max_wait_ms
-        tokio::time::timeout(Duration::from_micros(1), stream.next())
+        monoio::time::timeout(Duration::from_micros(1), stream.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         // Should not wait for max_wait_ms
-        tokio::time::timeout(Duration::from_micros(1), stream.next())
+        monoio::time::timeout(Duration::from_micros(1), stream.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn test_consumer_terminate() {
         let e = Error::ServerError {
             protocol_error: ProtocolError::OffsetOutOfRange,
@@ -665,7 +665,7 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn test_consumer_earliest() {
         let record = Record {
             key: Some(vec![0; 4]),
@@ -706,13 +706,13 @@ mod tests {
 
         // need a solid timeout here because we have simulated an error that caused a backoff
         let (record_and_offset, high_watermark) =
-            unwrap(tokio::time::timeout(Duration::from_secs(2), stream.next()).await);
+            unwrap(monoio::time::timeout(Duration::from_secs(2), stream.next()).await);
 
         assert_eq!(record_and_offset.offset, 2);
         assert_eq!(high_watermark, 2);
     }
 
-    #[tokio::test]
+    #[monoio::test_all(enable_timer = true)]
     async fn test_consumer_latest() {
         let record = Record {
             key: Some(vec![0; 4]),
@@ -753,7 +753,7 @@ mod tests {
 
         // need a solid timeout here because we have simulated an error that caused a backoff
         let (record_and_offset, high_watermark) =
-            unwrap(tokio::time::timeout(Duration::from_secs(2), stream.next()).await);
+            unwrap(monoio::time::timeout(Duration::from_secs(2), stream.next()).await);
 
         assert_eq!(record_and_offset.offset, 2);
         assert_eq!(high_watermark, 2);
@@ -764,12 +764,12 @@ mod tests {
     /// This will will try to poll the stream for a bit to ensure that async IO has a chance to catch up.
     async fn assert_stream_pending<S>(stream: &mut S)
     where
-        S: Stream + Send + Unpin,
+        S: Stream + Unpin,
         S::Item: std::fmt::Debug,
     {
         tokio::select! {
             e = stream.next() => panic!("stream is not pending, yielded: {e:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+            _ = monoio::time::sleep(Duration::from_millis(1)) => {},
         };
     }
 }

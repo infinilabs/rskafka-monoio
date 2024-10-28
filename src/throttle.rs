@@ -6,10 +6,7 @@ use tracing::warn;
 
 use crate::{backoff::ErrorOrThrottle, protocol::primitives::Int32};
 
-pub fn maybe_throttle<E>(throttle_time_ms: Option<Int32>) -> Result<(), ErrorOrThrottle<E>>
-where
-    E: Send,
-{
+pub fn maybe_throttle<E>(throttle_time_ms: Option<Int32>) -> Result<(), ErrorOrThrottle<E>> {
     let throttle_time_ms = throttle_time_ms.map(|t| t.0).unwrap_or_default();
     let throttle_time_ms: u64 = match throttle_time_ms.try_into() {
         Ok(t) => t,

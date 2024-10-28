@@ -17,17 +17,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - Receivers can be created with [`BroadcastOnce::receiver`]
 /// - The value can be produced with [`BroadcastOnce::broadcast`]
 #[derive(Debug)]
-pub struct BroadcastOnce<T>
-where
-    T: Send + Sync,
-{
+pub struct BroadcastOnce<T> {
     shared: Arc<Shared<T>>,
 }
 
-impl<T> Default for BroadcastOnce<T>
-where
-    T: Send + Sync,
-{
+impl<T> Default for BroadcastOnce<T> {
     fn default() -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -44,7 +38,7 @@ struct Shared<T> {
     notify: Notify,
 }
 
-impl<T: Clone + Send + Sync> BroadcastOnce<T> {
+impl<T: Clone> BroadcastOnce<T> {
     /// Returns a [`BroadcastOnceReceiver`] that can be used to wait on
     /// a call to [`BroadcastOnce::broadcast`] on this instance
     pub fn receiver(&self) -> BroadcastOnceReceiver<T> {
@@ -63,10 +57,7 @@ impl<T: Clone + Send + Sync> BroadcastOnce<T> {
     }
 }
 
-impl<T> Drop for BroadcastOnce<T>
-where
-    T: Send + Sync,
-{
+impl<T> Drop for BroadcastOnce<T> {
     fn drop(&mut self) {
         let mut data = self.shared.data.write();
         if data.is_none() {
@@ -82,7 +73,7 @@ pub struct BroadcastOnceReceiver<T> {
     shared: Arc<Shared<T>>,
 }
 
-impl<T: Clone + Send + Sync> BroadcastOnceReceiver<T> {
+impl<T: Clone> BroadcastOnceReceiver<T> {
     /// Returns `Some(_)` if data has been produced
     pub fn peek(&self) -> Option<Result<T>> {
         self.shared.data.read().clone()
@@ -108,7 +99,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn test_broadcast_once() {
         // Test no receiver
         let broadcast: BroadcastOnce<usize> = Default::default();
@@ -120,7 +111,7 @@ mod tests {
         assert!(receiver.peek().is_none());
 
         // Should timeout as no values produced
-        tokio::time::timeout(Duration::from_millis(1), receiver.receive())
+        monoio::time::timeout(Duration::from_millis(1), receiver.receive())
             .await
             .unwrap_err();
 

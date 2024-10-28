@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use assert_matches::assert_matches;
 use futures::{Stream, StreamExt};
-use tokio::time::timeout;
+use monoio::time::timeout;
 
 use rskafka::{
     client::{
@@ -18,7 +18,7 @@ use test_helpers::{maybe_start_logging, random_topic_name, record, TEST_TIMEOUT}
 
 mod test_helpers;
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_stream_consumer_start_at_0() {
     maybe_start_logging();
 
@@ -76,7 +76,7 @@ async fn test_stream_consumer_start_at_0() {
     assert_stream_pending(&mut stream).await;
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_stream_consumer_start_at_1() {
     maybe_start_logging();
 
@@ -122,7 +122,7 @@ async fn test_stream_consumer_start_at_1() {
     assert_stream_pending(&mut stream).await;
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_stream_consumer_offset_out_of_range() {
     maybe_start_logging();
 
@@ -161,7 +161,7 @@ async fn test_stream_consumer_offset_out_of_range() {
     assert!(stream.next().await.is_none());
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_stream_consumer_start_at_earliest() {
     maybe_start_logging();
 
@@ -217,7 +217,7 @@ async fn test_stream_consumer_start_at_earliest() {
     assert_stream_pending(&mut stream).await;
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_stream_consumer_start_at_earliest_empty() {
     maybe_start_logging();
 
@@ -264,7 +264,7 @@ async fn test_stream_consumer_start_at_earliest_empty() {
     assert_stream_pending(&mut stream).await;
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_stream_consumer_start_at_earliest_after_deletion() {
     maybe_start_logging();
 
@@ -318,7 +318,7 @@ async fn test_stream_consumer_start_at_earliest_after_deletion() {
     assert_stream_pending(&mut stream).await;
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_stream_consumer_start_at_latest() {
     maybe_start_logging();
 
@@ -369,7 +369,7 @@ async fn test_stream_consumer_start_at_latest() {
     assert_stream_pending(&mut stream).await;
 }
 
-#[tokio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_stream_consumer_start_at_latest_empty() {
     maybe_start_logging();
 
@@ -416,7 +416,7 @@ async fn test_stream_consumer_start_at_latest_empty() {
 }
 
 fn assert_ok(
-    r: Result<Option<<StreamConsumer as Stream>::Item>, tokio::time::error::Elapsed>,
+    r: Result<Option<<StreamConsumer as Stream>::Item>, monoio::time::error::Elapsed>,
 ) -> (RecordAndOffset, i64) {
     r.expect("no timeout")
         .expect("some records")
@@ -428,11 +428,11 @@ fn assert_ok(
 /// This will will try to poll the stream for a bit to ensure that async IO has a chance to catch up.
 async fn assert_stream_pending<S>(stream: &mut S)
 where
-    S: Stream + Send + Unpin,
+    S: Stream + Unpin,
     S::Item: std::fmt::Debug,
 {
     tokio::select! {
         e = stream.next() => panic!("stream is not pending, yielded: {e:?}"),
-        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+        _ = monoio::time::sleep(Duration::from_secs(1)) => {},
     };
 }
