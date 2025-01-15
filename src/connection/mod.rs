@@ -56,7 +56,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Error)]
-pub struct MultiError(Vec<Box<dyn std::error::Error>>);
+pub struct MultiError(Vec<Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>>);
 
 impl Display for MultiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -488,7 +488,8 @@ where
     let mut backoff = Backoff::new(backoff_config);
     backoff
         .retry_with_backoff("broker_connect", || async {
-            let mut errors = Vec::<Box<dyn std::error::Error>>::new();
+            let mut errors =
+                Vec::<Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>>::new();
             for broker in &brokers {
                 let conn = broker
                     .connect(
@@ -511,8 +512,11 @@ where
 
                 return ControlFlow::Break(connection);
             }
-            let err = Box::<dyn std::error::Error>::from(MultiError(errors));
-            let err: Arc<dyn std::error::Error> = err.into();
+            let err = Box::<dyn std::error::Error + std::marker::Send + std::marker::Sync>::from(
+                MultiError(errors),
+            );
+            let err: Arc<dyn std::error::Error + std::marker::Send + std::marker::Sync> =
+                err.into();
             ControlFlow::Continue(ErrorOrThrottle::Error(err))
         })
         .await
