@@ -26,7 +26,7 @@ impl Default for BackoffConfig {
     }
 }
 
-type SourceError = Box<dyn std::error::Error>;
+type SourceError = Box<dyn std::error::Error + std::marker::Send + std::marker::Sync>;
 
 #[derive(Debug, thiserror::Error)]
 #[allow(missing_copy_implementations)]
@@ -105,7 +105,7 @@ impl Backoff {
     where
         F: (Fn() -> F1),
         F1: std::future::Future<Output = ControlFlow<B, ErrorOrThrottle<E>>>,
-        E: std::error::Error + 'static,
+        E: std::error::Error + std::marker::Send + std::marker::Sync + 'static,
     {
         loop {
             // split match statement from `monoio::time::sleep`, because otherwise rustc requires `B: Send`
